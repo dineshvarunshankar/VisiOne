@@ -1,90 +1,113 @@
-import whisper
-import sounddevice as sd
-import numpy as np
+from contextlib import ExitStack, suppress
+import queue
+import re
 import threading
 import time
-from config import MIC_DEVICE_INDEX, WAKE_WORD, LISTENING_TIMEOUT, DEVICE
+
+import numpy as np
+import sounddevice as sd
+import whisper
+
+from config import DEVICE, LISTENING_TIMEOUT, MIC_DEVICE_INDEX, WAKE_WORD
+
 
 class QueryListener:
     def __init__(self, speaking_event=None, enabled: bool = True):
         self.enabled = enabled
-        if not enabled: return
-        
-        print("Loading Whisper...")
-        self.model = whisper.load_model("tiny.en", device=DEVICE)
-        self.blocksize = 16000 * 3
-        self.buffer = np.zeros(0, dtype=np.float32)
-        
+        self.stream = None
+        self.worker = None
+        self.stopped = threading.Event()
+        self.audio_queue = queue.Queue(maxsize=2)
+        self.lock = threading.Lock()
+        self.query = None
+        self.speaking_event = speaking_event
         self.is_waiting = False
         self.wait_start = 0
-        self.query = None
-        self.lock = threading.Lock()
-        
-        # Words to remove to isolate the object name
+        self.blocksize = 16000 * 3
         self.stop_words = {
-            "find", "search", "look", "see", "where", "wheres", "is", "are", 
-            "the", "a", "an", "my", "me", "you", "can", "do", "did"
+            'find', 'search', 'look', 'see', 'where', 'wheres', 'is', 'are',
+            'the', 'a', 'an', 'my', 'me', 'you', 'can', 'do', 'did',
         }
+        if enabled:
+            self.model = whisper.load_model('tiny.en', device=DEVICE)
 
     def start(self):
-        if not self.enabled: return
-        def callback(indata, frames, time, status):
-            audio = indata[:, 0].astype(np.float32)
-            if np.mean(np.abs(audio)) > 0.002:
-                with self.lock:
-                    self.buffer = np.append(self.buffer, audio)
-                    if len(self.buffer) >= self.blocksize: self._process()
-        try:
-            self.stream = sd.InputStream(device=MIC_DEVICE_INDEX, samplerate=16000, channels=1, blocksize=self.blocksize, callback=callback)
+        if not self.enabled or self.stream is not None:
+            return
+        if self.stopped.is_set():
+            raise RuntimeError('Listener has been stopped')
+        with ExitStack() as startup:
+            startup.callback(self.stop)
+            self.stream = sd.InputStream(
+                device=MIC_DEVICE_INDEX, samplerate=16000, channels=1,
+                blocksize=self.blocksize, callback=self._capture,
+            )
+            self.worker = threading.Thread(target=self._listen, daemon=True)
+            self.worker.start()
             self.stream.start()
-            print(f"Mic Active. Say '{WAKE_WORD}'.")
-        except Exception as e: print(f"[Listener Error] {e}")
+            startup.pop_all()
 
-    def _process(self):
-        try:
-            res = self.model.transcribe(self.buffer, fp16=False)
-            text = res['text'].strip().lower()
-            clean = text.replace(",", "").replace(".", "").replace("!", "").replace("?", "")
-            
-            if len(clean) < 2: return
+    def _capture(self, indata, frames, timing, status):
+        if self.stopped.is_set() or (self.speaking_event and self.speaking_event.is_set()):
+            return
+        audio = indata[:, 0].astype(np.float32).copy()
+        if np.mean(np.abs(audio)) <= 0.002:
+            return
+        captured_end = time.monotonic()
+        captured_start = captured_end - frames / 16000
+        with suppress(queue.Full):
+            self.audio_queue.put_nowait((audio, captured_start, captured_end))
 
-            target = WAKE_WORD.lower()
-            now = time.time()
+    def _listen(self):
+        while not self.stopped.is_set():
+            try:
+                audio, captured_start, captured_end = self.audio_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            try:
+                result = self.model.transcribe(audio, fp16=False)
+                if not self.stopped.is_set():
+                    self._process_text(result['text'], captured_start, captured_end)
+            except Exception as exc:
+                print(f'[Listener Error] {exc}', flush=True)
 
-            # Timeout
-            if self.is_waiting and (now - self.wait_start > LISTENING_TIMEOUT):
-                print("[Listener] Timeout.")
-                self.is_waiting = False
-
-            command = ""
-            if target in clean:
-                parts = clean.split(target, 1)
-                if len(parts) > 1 and len(parts[1].strip()) > 1:
-                    command = parts[1].strip()
-                else:
-                    print(f"[Listener] Trigger heard. Waiting...")
-                    self.is_waiting = True
-                    self.wait_start = now
-                    return
-            elif self.is_waiting:
-                command = clean
-
-            if command:
-                words = command.split()
-                keywords = [w for w in words if w not in self.stop_words]
-                final_q = " ".join(keywords)
-                
-                if len(final_q) > 1:
-                    print(f"[Listener] Command: '{final_q}'")
-                    self.query = final_q
-                    self.is_waiting = False
-
-        except Exception as e: print(f"[Listener Error] {e}")
-        finally: self.buffer = np.zeros(0, dtype=np.float32)
+    def _process_text(self, text, captured_start, captured_end):
+        clean = re.sub(r'[^\w\s]', '', text.lower()).strip()
+        if len(clean) < 2:
+            return
+        if self.is_waiting and captured_start - self.wait_start > LISTENING_TIMEOUT:
+            self.is_waiting = False
+        target = re.search(r'\b' + re.escape(WAKE_WORD.lower()) + r'\b', clean)
+        if target:
+            command = clean[target.end():].strip()
+            if not command:
+                self.is_waiting = True
+                self.wait_start = captured_end
+                return
+        elif self.is_waiting:
+            command = clean
+        else:
+            return
+        query = ' '.join(word for word in command.split() if word not in self.stop_words)
+        if len(query) > 1:
+            with self.lock:
+                self.query = query
+            self.is_waiting = False
 
     def get_query(self):
-        if not self.enabled: return None
-        with self.lock: q = self.query; self.query = None; return q
+        with self.lock:
+            query, self.query = self.query, None
+        return query
 
     def stop(self):
-        if self.stream: self.stream.stop(); self.stream.close()
+        self.stopped.set()
+        stream, self.stream = self.stream, None
+        with suppress(queue.Empty):
+            while True:
+                self.audio_queue.get_nowait()
+        with ExitStack() as cleanup:
+            if self.worker is not None:
+                cleanup.callback(self.worker.join, timeout=1)
+            if stream is not None:
+                cleanup.callback(stream.close)
+                cleanup.callback(stream.stop)

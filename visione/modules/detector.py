@@ -13,13 +13,12 @@ class OpenVocabDetector:
         self.is_world_model = "world" in YOLO_MODEL_PATH.lower()
         print(f"Loading Detector: {model_path} (World Mode: {self.is_world_model})...")
         
-        # Load Model
         self.model = YOLOWorld(model_path) if self.is_world_model else YOLO(model_path)
         self.model.to(DEVICE)
         self.last_prompts = []
 
     def detect(self, frame: np.ndarray, prompts: list) -> list:
-        # Optimization: Update classes only on change
+        # Update text embeddings only when prompts change.
         if self.is_world_model and sorted(prompts) != sorted(self.last_prompts):
             self.model.set_classes(prompts)
             self.last_prompts = prompts.copy()
@@ -36,7 +35,7 @@ class OpenVocabDetector:
                 
                 track_id = int(results.boxes.id[i]) if results.boxes.id is not None else -1
                 
-                # Mask Fallback
+                # Use the bounding box when segmentation is unavailable.
                 if results.masks is not None:
                     mask = results.masks.data[i].cpu().numpy().astype(bool)
                     if mask.shape[:2] != frame.shape[:2]:
@@ -44,7 +43,6 @@ class OpenVocabDetector:
                 else:
                     mask = np.zeros(frame.shape[:2], dtype=bool)
                     x1, y1, x2, y2 = box
-                    # Clamp
                     x1, y1 = max(0, x1), max(0, y1)
                     x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
                     mask[y1:y2, x1:x2] = True

@@ -1,158 +1,179 @@
-import torch.multiprocessing as mp
+from contextlib import ExitStack, suppress
+import multiprocessing as mp
 import os
 import queue
-import time
-import numpy as np
 import threading
-from config import TTS_ENGINE, TTS_MODEL, TTS_LANGUAGE, TTS_RATE, TTS_SPEAKER_WAV, TTS_BASE_RATE, DEVICE
+
+from config import (
+    DEVICE, TTS_BASE_RATE, TTS_ENGINE, TTS_LANGUAGE, TTS_MODEL,
+    TTS_RATE, TTS_SPEAKER_WAV,
+)
+
 
 class CoquiVoice:
     def __init__(self, config):
-
-        # Import dependencies locally to manage dependencies for different engines
         from TTS.api import TTS
-        
-        self.config = config
-        self.tts = None
-        self.is_busy = False # Busy flag for AI engine
 
-        # Smart cross-platform device selection
-        if DEVICE == "mps":
-            self.device = "cpu"
-            print("[TTS] Apple Silicon (M1/M2/M3) detected - Running xTTS to CPU", flush=True)
+        self.config = config
+        self.device = "cpu" if config['device'] == "mps" else config['device']
+        self.tts = TTS(model_name=config['model'], progress_bar=False).to(self.device)
+
+    def synthesize(self, text):
+        return self.tts.tts(
+            text=text,
+            speaker_wav=self.config['speaker'],
+            language=self.config['lang'],
+            speed=self.config['rate'] / self.config['base_rate'],
+        )
+
+
+def _voice_worker(input_queue, status_queue, generation, priorities, stopped, config):
+    engine = None
+    sd = None
+    try:
+        if config['engine'] == 'ai':
+            import numpy as np
+            import sounddevice as sd
+
+            engine = CoquiVoice(config)
         else:
-            self.device = "cuda" # Force cuda for most stable MP/MT operation
-            print(f"[TTS] Running xTTS on CUDA", flush=True)
-        
-        try:
-            # Load the model in the thread/process where it will be used
-            self.tts = TTS(model_name=self.config['model'], progress_bar=False).to(self.device)
-            if self.tts is None or not hasattr(self.tts, 'tts'):
-                 raise RuntimeError("TTS model failed to initialize fully.")
-            print("[TTS] AI Voice Model Loaded.", flush=True)
-        except Exception as e:
-             print(f"[TTS Critical] AI Load Failed: {e}", flush=True)
-             raise
+            import pyttsx3
 
-    def speak(self, text):
-        if self.is_busy: return # Drop request if busy
-        threading.Thread(target=self._run_tts, args=(text,), daemon=True).start()
-
-    def _run_tts(self, text):
-        import sounddevice as sd
-        self.is_busy = True # Lock the door
-        
-        try:
-            mult = self.config['rate'] / self.config['base_rate']
-            
-            # 1. Synthesize
-            wav = self.tts.tts(
-                text=text,
-                speaker_wav=self.config['speaker'],
-                language=self.config['lang'],
-                speed=mult
-            )
-            
-            # 2. Play
-            wav_np = np.array(wav, dtype=np.float32)
-            sd.play(wav_np, samplerate=24000) 
-            sd.wait() # Block this specific thread until audio finishes
-
-        except Exception as e:
-            print(f"[TTS Error] {e}", flush=True)
-        
-        finally:
-            self.is_busy = False # Unlock the door
-
-# System Voice (pyttsx3) Process
-class SystemVoiceProcess(mp.Process):
-    def __init__(self, input_queue, interrupt_event, ready_event, config):
-        super().__init__()
-        self.input_queue = input_queue
-        self.interrupt_event = interrupt_event
-        self.ready_event = ready_event
-        self.config = config
-        self.daemon = True 
-
-    def run(self):
-        import pyttsx3
-        print("[TTS] System Voice Ready.", flush=True)
-        self.ready_event.set()
-        
-        while True:
-            try: text = self.input_queue.get(timeout=0.1)
-            except queue.Empty: continue
-            if text == "STOP": break
-            
-            self.interrupt_event.clear()
+            engine = pyttsx3.init()
+            engine.setProperty('rate', config['rate'])
+            engine.startLoop(False)
+        status_queue.put(None)
+        while not stopped.wait(0.01):
+            with generation.get_lock():
+                try:
+                    version, text, priority = input_queue.get_nowait()
+                except queue.Empty:
+                    continue
+                priorities[1] = -1
+                if version != generation.value:
+                    continue
+                priorities[0] = priority
             try:
-                # Re-initialize engine inside loop to prevent potential cross-process issues
-                engine = pyttsx3.init() 
-                engine.setProperty('rate', self.config['rate'])
-                engine.say(text)
-                engine.runAndWait()
-                # Clean up to release resources
-                del engine 
-            except Exception as e: print(f"[TTS Error] {e}", flush=True)
+                if config['engine'] == 'ai':
+                    wav = np.asarray(engine.synthesize(text), dtype=np.float32)
+                    with generation.get_lock():
+                        if stopped.is_set() or version != generation.value:
+                            continue
+                        sd.play(wav, samplerate=24000)
+                    while sd.get_stream().active and not stopped.wait(0.01):
+                        if version != generation.value:
+                            break
+                    sd.stop()
+                else:
+                    engine.say(text)
+                    engine.iterate()
+                    while engine.isBusy() and not stopped.wait(0.01):
+                        if version != generation.value:
+                            break
+                        engine.iterate()
+                    engine.stop()
+            finally:
+                with generation.get_lock():
+                    priorities[0] = -1
+    except Exception as exc:
+        status_queue.put(str(exc))
+    finally:
+        if sd is not None:
+            sd.stop()
+        elif engine is not None:
+            engine.stop()
+            engine.endLoop()
 
 
-#Main Voice Guide Class
 class VoiceGuide:
+    STARTUP_TIMEOUT = 60
+
     def __init__(self):
-        # Configuration setup
-        path = os.path.join(os.getcwd(), TTS_SPEAKER_WAV) if not os.path.exists(TTS_SPEAKER_WAV) else TTS_SPEAKER_WAV
-        self.cfg = {'engine': TTS_ENGINE, 'device': DEVICE, 'model': TTS_MODEL, 'lang': TTS_LANGUAGE, 'rate': TTS_RATE, 'base_rate': TTS_BASE_RATE, 'speaker': path}
-        
-        self.engine = None
-        self.queue = None
-        self.interrupt_event = None
-        self.process = None
-        self.ready_event = mp.Event() 
-        
-        print(f"[TTS] Starting Voice Engine ({TTS_ENGINE.upper()})...")
-
-        # Conditional Initialization
-        if self.cfg['engine'] == "system":
-            self.queue = mp.Queue()
-            self.interrupt_event = mp.Event()
-            self.process = SystemVoiceProcess(self.queue, self.interrupt_event, self.ready_event, self.cfg)
+        self.cfg = {
+            'engine': TTS_ENGINE, 'device': DEVICE, 'model': TTS_MODEL,
+            'lang': TTS_LANGUAGE, 'rate': TTS_RATE,
+            'base_rate': TTS_BASE_RATE, 'speaker': os.path.abspath(TTS_SPEAKER_WAV),
+        }
+        if TTS_ENGINE not in {'system', 'ai'}:
+            raise ValueError(f"Unknown TTS engine: {TTS_ENGINE}")
+        if TTS_ENGINE == 'ai' and not os.path.isfile(self.cfg['speaker']):
+            raise FileNotFoundError(f"TTS speaker recording not found: {self.cfg['speaker']}")
+        context = mp.get_context('spawn')
+        self.queue = context.Queue(maxsize=1)
+        self.status_queue = context.Queue()
+        self.generation = context.Value('L', 0)
+        self.priorities = context.Array('i', [-1, -1], lock=False)
+        self.stopped = context.Event()
+        self.lock = threading.Lock()
+        self.ready = False
+        self.process = context.Process(
+            target=_voice_worker,
+            args=(self.queue, self.status_queue, self.generation, self.priorities, self.stopped, self.cfg),
+            daemon=True,
+        )
+        with ExitStack() as startup:
+            startup.callback(self.stop)
             self.process.start()
-        
-        elif self.cfg['engine'] == "ai":
             try:
-                # Initialize the Coqui model directly in the main thread/process
-                self.engine = CoquiVoice(self.cfg)
-                self.ready_event.set() # Unblock immediately as initialization is done here
-            except Exception as e:
-                print(f"[TTS] Failed to initialize AI engine. System will not speak. Error: {e}", flush=True)
-                self.engine = None # Ensure engine is None on failure
+                error = self.status_queue.get(timeout=self.STARTUP_TIMEOUT)
+            except queue.Empty as exc:
+                raise TimeoutError("Voice initialization timed out") from exc
+            if error is not None:
+                raise RuntimeError(f"Voice initialization failed: {error}")
+            self.ready = True
+            startup.pop_all()
 
-        else:
-            print(f"[TTS] Unknown engine type '{TTS_ENGINE}'. Voice system disabled.")
-
-        # BLOCKING WAIT (only blocks if using SystemVoiceProcess)
-        self.ready_event.wait()
-        print("[TTS] Engine Loaded. Starting Vision System.")
-
-
-    def speak(self, text: str, interrupt: bool = False):
-        if self.cfg['engine'] == "system":
-            if self.queue:
-                if interrupt:
-                    self.interrupt_event.set()
-                    while not self.queue.empty():
-                        try: self.queue.get_nowait()
-                        except queue.Empty: break
-                self.queue.put(text)
-        
-        elif self.cfg['engine'] == "ai" and self.engine:
-            # AI engine handles its own thread/busy logic internally (in CoquiVoice.speak)
-            self.engine.speak(text)
-
+    def speak(self, text: str, interrupt: bool = False, priority=None):
+        if not text:
+            return False
+        with self.lock:
+            if not self.ready or self.stopped.is_set():
+                return False
+            if not self.process.is_alive():
+                self.ready = False
+                try:
+                    error = self.status_queue.get(timeout=0.1)
+                except queue.Empty:
+                    error = 'voice worker exited'
+                raise RuntimeError(f"Voice playback failed: {error}")
+            priority = (1 if interrupt else 0) if priority is None else priority
+            if not isinstance(priority, int) or priority < 0:
+                raise ValueError('Speech priority must be a nonnegative integer')
+            with self.generation.get_lock():
+                current_priority = max(self.priorities)
+                if priority < current_priority or (interrupt and priority == current_priority):
+                    return False
+                preempt = current_priority >= 0 and priority > current_priority
+                if preempt:
+                    self.generation.value += 1
+                    with suppress(queue.Empty):
+                        self.queue.get(timeout=0.05)
+                    self.priorities[1] = -1
+                try:
+                    self.queue.put(
+                        (self.generation.value, text, priority),
+                        timeout=0.1 if preempt else 0,
+                    )
+                except queue.Full:
+                    return False
+                self.priorities[1] = priority
+                return True
 
     def stop(self):
-        if self.cfg['engine'] == "system" and self.queue: 
-            self.queue.put("STOP")
-            self.process.join()
-        
-      
+        with self.lock:
+            if self.stopped.is_set():
+                return
+            self.ready = False
+            self.stopped.set()
+        if self.process.pid is not None:
+            self.process.join(timeout=1)
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(timeout=1)
+            if self.process.is_alive():
+                self.process.kill()
+                self.process.join(timeout=1)
+            self.process.close()
+        for channel in (self.queue, self.status_queue):
+            channel.cancel_join_thread()
+            channel.close()

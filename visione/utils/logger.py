@@ -24,16 +24,6 @@ class Logger:
             self.log_file.write(log_str + "\n")
             self.log_file.flush()
 
-    def log_detection(self, fused_detections: list):
-        if not fused_detections:
-            return
-        
-        summary = []
-        for label, _, _, conf, _, distance, _, velocity, direction, age in fused_detections:
-            dist_str = f"{distance:.1f}m" if distance else "None"
-            dir_str = direction[:4].title() if direction != "stationary" else "Stat"
-            summary.append(f"{label} ({dir_str}, {dist_str})")
-
     def save_frame(self, combined_visual: np.ndarray):
         if self.video_writer:
             self.video_writer.write(combined_visual)

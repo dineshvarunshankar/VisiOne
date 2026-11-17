@@ -9,7 +9,6 @@ class Visualizer:
         mask_accumulator = np.zeros((h, w), dtype=bool)
         annotated = frame.copy()
         
-        # Unpack 10 items
         for label, _, box, _, _, distance, valid_mask, velocity, direction, track_age in fused_detections:
             is_threat = "approaching" in direction or (distance is not None and distance < DISTANCE_WARN_NEAR)
             color = (0, 0, 255) if is_threat else (0, 255, 0)
