@@ -15,13 +15,15 @@ class FusionEngine:
                 continue
 
             depth_patch = depth[y1:y2, x1:x2]
-            valid_pixels = depth_patch[depth_patch > 0]
+            valid_mask = np.isfinite(depth_patch) & (depth_patch > 0)
+            if mask is not None and mask.shape == depth.shape:
+                valid_mask &= mask[y1:y2, x1:x2].astype(bool)
+            valid_pixels = depth_patch[valid_mask]
             
             if valid_pixels.size == 0:
                 fused_detections.append((label, mask, box, conf_det, track_id, None, None, velocity, direction, track_age))
                 continue
 
-            # Metric Foreground Logic
             k = int(valid_pixels.size * (PERCENTILE_CLOSEST / 100.0))
             if k < valid_pixels.size:
                 closest_val = np.partition(valid_pixels, k)[k]
@@ -29,7 +31,7 @@ class FusionEngine:
                 closest_val = np.min(valid_pixels)
             
             cutoff = closest_val * BACKGROUND_CUTOFF_RATIO
-            local_mask = depth_patch <= cutoff
+            local_mask = valid_mask & (depth_patch <= cutoff)
             
             foreground_depths = depth_patch[local_mask]
             distance = np.mean(foreground_depths) if foreground_depths.size > 0 else closest_val

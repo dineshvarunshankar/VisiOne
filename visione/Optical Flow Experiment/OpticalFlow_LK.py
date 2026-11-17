@@ -6,9 +6,7 @@ import matplotlib.pyplot as plt
 root = os.getcwd()
 videoPath = os.path.join(root, "walk1.mp4")
 videoCapObj = cv.VideoCapture(videoPath)
-# ---------------------------------------------------------
-#   SPARSE OPTICAL FLOW — LUCAS-KANADE (FEATURE TRACKING)
-# ---------------------------------------------------------
+# Sparse Lucas–Kanade flow
 def lucasKanade(videoCapObj):
 
     shiTomasiCornerParams = dict(maxCorners=20, qualityLevel=0.3, minDistance=50, blockSize=7)
@@ -17,7 +15,6 @@ def lucasKanade(videoCapObj):
 
     randomColors = np.random.randint(0, 255, (100, 3))
 
-    # First frame
     ret, frameFirst = videoCapObj.read()
     if not ret:
         print("Video not found")
@@ -27,12 +24,10 @@ def lucasKanade(videoCapObj):
     cornersPrev = cv.goodFeaturesToTrack(frameGrayPrev, mask=None, **shiTomasiCornerParams)
     mask = np.zeros_like(frameFirst)
 
-    # -------------------- SAVE VIDEO SETUP --------------------
     fourcc = cv.VideoWriter_fourcc(*'mp4v')
     fps = 30
     height, width, _ = frameFirst.shape
     videoWriter = cv.VideoWriter('lucas_kanade_output.mp4', fourcc, fps, (width, height))
-    # -----------------------------------------------------------
 
     while True:
         ret, frame = videoCapObj.read()
@@ -63,9 +58,7 @@ def lucasKanade(videoCapObj):
 
             cv.imshow("Lucas-Kanade Optical Flow", img)
 
-            # --------------- WRITE FRAME TO VIDEO ----------------
             videoWriter.write(img)
-            # -----------------------------------------------------
 
             frameGrayPrev = frameGrayCur.copy()
             cornersPrev = cornersMatchedCur.reshape(-1, 1, 2)
@@ -73,21 +66,16 @@ def lucasKanade(videoCapObj):
         if cv.waitKey(15) & 0xFF == ord('q'):
             break
 
-    # ----------------- RELEASE VIDEO WRITER --------------------
     videoWriter.release()
-    # ------------------------------------------------------------
 
     videoCapObj.release()
     cv.destroyAllWindows()
 
 
 
-# ---------------------------------------------------------
-#   DENSE OPTICAL FLOW — FARNEBACK (HSV Visualization)
-# ---------------------------------------------------------
+# Dense Farnebäck flow
 def denseOpticalFlow(videoCapObj):
 
-    # Read first frame
     ret, frameFirst = videoCapObj.read()
     if not ret:
         print("Failed to load video")
@@ -95,18 +83,14 @@ def denseOpticalFlow(videoCapObj):
 
     imgPrev = cv.cvtColor(frameFirst, cv.COLOR_BGR2GRAY)
 
-    # Create HSV image for visualization
     imgHSV = np.zeros_like(frameFirst)
     imgHSV[..., 1] = 255
 
-    # ------------------- SAVE VIDEO SETUP -------------------
     fourcc = cv.VideoWriter_fourcc(*'mp4v')
-    fps = 30  # You can also use videoCapObj.get(cv.CAP_PROP_FPS)
+    fps = 30  # Output frame rate
     height, width, _ = frameFirst.shape
     videoWriter = cv.VideoWriter('dense_optical_flow.mp4', fourcc, fps, (width, height))
-    # ---------------------------------------------------------
 
-    # Process video frames
     while True:
         ret, frameCur = videoCapObj.read()
         if not ret:
@@ -114,7 +98,6 @@ def denseOpticalFlow(videoCapObj):
 
         imgCur = cv.cvtColor(frameCur, cv.COLOR_BGR2GRAY)
 
-        # Compute dense optical flow
         flow = cv.calcOpticalFlowFarneback(
             prev=imgPrev,
             next=imgCur,
@@ -130,38 +113,28 @@ def denseOpticalFlow(videoCapObj):
 
         mag, ang = cv.cartToPolar(flow[..., 0], flow[..., 1])
 
-        # Hue = direction
+        # Hue encodes flow direction.
         imgHSV[..., 0] = ang * 180 / np.pi / 2
 
-        # Value = magnitude
+        # Brightness encodes flow magnitude.
         imgHSV[..., 2] = cv.normalize(mag, None, 0, 255, cv.NORM_MINMAX)
 
-        # Convert HSV to BGR for viewing
         imgBGR = cv.cvtColor(imgHSV, cv.COLOR_HSV2BGR)
 
-        # Show output
         cv.imshow("Dense Optical Flow (Farneback)", imgBGR)
 
-        # ---------------- WRITE FRAME TO VIDEO ----------------
         videoWriter.write(imgBGR)
-        # -------------------------------------------------------
 
         imgPrev = imgCur
 
         if cv.waitKey(15) & 0xFF == ord('q'):
             break
 
-    # ---------------- RELEASE VIDEO WRITER -------------------
     videoWriter.release()
-    # ---------------------------------------------------------
 
     cv.destroyAllWindows()
 
 
 
-# ---------------------------------------------------------
-#   MAIN
-# ---------------------------------------------------------
 if __name__ == "__main__":
-    #lucasKanade(videoCapObj)
     denseOpticalFlow(videoCapObj)
